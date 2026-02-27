@@ -1,0 +1,32 @@
+{
+  "name": "voidnote-sdk",
+  "version": "0.1.0",
+  "description": "Official SDK for VoidNote — zero-knowledge self-destructing notes",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["voidnote", "secrets", "encryption", "zero-knowledge", "self-destructing"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/quantum-encoding/voidnote-js"
+  },
+  "homepage": "https://voidnote.net",
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
