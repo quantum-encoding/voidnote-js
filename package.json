@@ -1,7 +1,7 @@
 {
   "name": "voidnote-sdk",
-  "version": "0.1.0",
-  "description": "Official SDK for VoidNote — zero-knowledge self-destructing notes",
+  "version": "0.2.0",
+  "description": "Official SDK for VoidNote — zero-knowledge self-destructing notes and live encrypted streams",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
