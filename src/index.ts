@@ -7,6 +7,15 @@
  * (anything with Web Crypto API + fetch).
  */
 
+/**
+ * How a note's AES key is derived from the 32-hex secret in its link.
+ *   sha256:             key = SHA-256(secret bytes)
+ *   pbkdf2-sha256-600k: key = PBKDF2-HMAC-SHA256(password UTF-8, salt = secret bytes, 600000 iterations)
+ */
+export type NoteKdf = "sha256" | "pbkdf2-sha256-600k";
+
+export const PBKDF2_ITERATIONS = 600_000;
+
 export interface ReadResult {
   content: string;
   title: string | null;
@@ -14,18 +23,33 @@ export interface ReadResult {
   maxViews: number;
   destroyed: boolean;
   viewsRemaining?: number; // v1 URLs only
+  kdf?: NoteKdf;           // v1 URLs only
+}
+
+export interface ReadOptions {
+  /** The sender's password, for notes created with one. Ignored for notes without one. */
+  password?: string;
+  /** Override the base URL (default: https://voidnote.net). */
+  base?: string;
 }
 
 export interface CreateOptions {
-  apiKey: string;
-  maxViews?: number;                              // 1–100, default 1
-  expiresIn?: 1 | 6 | 24 | 72 | 168 | 720;      // hours, default 1
+  /** vn_... key from a free account. Without one the note is anonymous (up to 168 hours and 10 views). */
+  apiKey?: string;
+  /** Protect the note with a password as well as the link (kdf pbkdf2-sha256-600k). */
+  password?: string;
+  /** Views before the note is destroyed, default 1. Up to 10 anonymous, 100 with an API key. */
+  maxViews?: number;
+  /** Hours until expiry, default 1. Up to 168 anonymous, 720 with an API key. */
+  expiresIn?: number;
 }
 
 export interface CreateResult {
   url: string;      // full shareable link — includes #secret fragment for v1 notes
   token: string;    // 32-char tokenId
   expiresAt: string;
+  viewLimit: number;
+  kdf: NoteKdf;
 }
 
 export interface PeekResult {
@@ -35,9 +59,35 @@ export interface PeekResult {
   expiresAt?: string;
   viewLimit?: number;
   viewsRemaining?: number;
+  kdf?: NoteKdf;
+}
+
+export type VoidNoteErrorCode =
+  | "http"               // the server refused the request; see status and retryAfter
+  | "not_found"          // the note does not exist, expired, or its views are used up
+  | "password_required"  // the note needs a password; no view was used
+  | "unsupported_kdf"    // the note uses a key derivation this SDK version cannot do; no view was used
+  | "decryption_failed"; // wrong password or link; the view was used
+
+/** Every failure the notes and streams API reports. */
+export class VoidNoteError extends Error {
+  readonly code: VoidNoteErrorCode;
+  /** HTTP status, for code "http". */
+  readonly status: number | null;
+  /** Seconds the server asked to wait (Retry-After), when it sent one. */
+  readonly retryAfter: number | null;
+
+  constructor(message: string, code: VoidNoteErrorCode, status: number | null = null, retryAfter: number | null = null) {
+    super(message);
+    this.name = "VoidNoteError";
+    this.code = code;
+    this.status = status;
+    this.retryAfter = retryAfter;
+  }
 }
 
 const DEFAULT_BASE = "https://voidnote.net";
+const KDFS: readonly NoteKdf[] = ["sha256", "pbkdf2-sha256-600k"];
 
 // --- helpers ---
 
@@ -54,16 +104,76 @@ function hexToBytes(hex: string) {
   return bytes;
 }
 
+/** Retry-After as seconds: either delta-seconds or an HTTP date. */
+function parseRetryAfter(value: string | null): number | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed);
+  const at = Date.parse(trimmed);
+  return Number.isNaN(at) ? null : Math.max(0, Math.ceil((at - Date.now()) / 1000));
+}
+
+/** VoidNoteError carrying the HTTP status, Retry-After and the server's error message. */
+async function httpError(res: Response): Promise<VoidNoteError> {
+  let detail = "";
+  try {
+    const text = (await res.text()).trim();
+    try {
+      detail = (JSON.parse(text) as { error?: string }).error ?? text;
+    } catch {
+      detail = text;
+    }
+  } catch {
+    // body unreadable — status alone
+  }
+  const retryAfter = parseRetryAfter(res.headers.get("retry-after"));
+  const message =
+    `VoidNote: HTTP ${res.status}${detail ? ` — ${detail.slice(0, 300)}` : ""}` +
+    (retryAfter !== null ? ` (retry after ${retryAfter}s)` : "");
+  return new VoidNoteError(message, "http", res.status, retryAfter);
+}
+
+async function getJson(url: string, init?: RequestInit): Promise<any> {
+  const res = await fetch(url, init);
+  if (!res.ok) throw await httpError(res);
+  return res.json();
+}
+
 async function deriveKey(secret: string, usage: KeyUsage[]): Promise<CryptoKey> {
-  const keyMat = await crypto.subtle.digest("SHA-256", hexToBytes(secret).buffer as ArrayBuffer);
+  return deriveNoteKey(secret, "sha256", null, usage);
+}
+
+async function deriveNoteKey(
+  secret: string,
+  kdf: NoteKdf,
+  password: string | null,
+  usage: KeyUsage[],
+): Promise<CryptoKey> {
+  const secretBytes = hexToBytes(secret);
+  let keyMat: ArrayBuffer;
+  if (kdf === "pbkdf2-sha256-600k") {
+    if (!password) {
+      throw new VoidNoteError("VoidNote: this note needs a password", "password_required");
+    }
+    const base = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(password),
+      "PBKDF2",
+      false,
+      ["deriveBits"],
+    );
+    keyMat = await crypto.subtle.deriveBits(
+      { name: "PBKDF2", hash: "SHA-256", salt: secretBytes, iterations: PBKDF2_ITERATIONS },
+      base,
+      256,
+    );
+  } else {
+    keyMat = await crypto.subtle.digest("SHA-256", secretBytes);
+  }
   return crypto.subtle.importKey("raw", keyMat, { name: "AES-GCM", length: 256 }, false, usage);
 }
 
-async function encryptContent(
-  content: string,
-  secret: string,
-): Promise<{ encrypted: string; iv: string }> {
-  const key = await deriveKey(secret, ["encrypt"]);
+async function encryptWithKey(content: string, key: CryptoKey): Promise<{ encrypted: string; iv: string }> {
   const iv = new Uint8Array(12);
   crypto.getRandomValues(iv);
   const ciphertext = await crypto.subtle.encrypt(
@@ -74,14 +184,49 @@ async function encryptContent(
   return { encrypted: bufToHex(new Uint8Array(ciphertext)), iv: bufToHex(iv) };
 }
 
-async function decryptContent(encHex: string, ivHex: string, secret: string): Promise<string> {
-  const key = await deriveKey(secret, ["decrypt"]);
-  const plain = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: hexToBytes(ivHex) },
-    key,
-    hexToBytes(encHex),
-  );
+async function encryptContent(
+  content: string,
+  secret: string,
+): Promise<{ encrypted: string; iv: string }> {
+  return encryptWithKey(content, await deriveKey(secret, ["encrypt"]));
+}
+
+async function decryptNote(
+  encHex: string,
+  ivHex: string,
+  secret: string,
+  kdf: NoteKdf,
+  password: string | null,
+): Promise<string> {
+  const key = await deriveNoteKey(secret, kdf, password, ["decrypt"]);
+  let plain: ArrayBuffer;
+  try {
+    plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: hexToBytes(ivHex) }, key, hexToBytes(encHex));
+  } catch {
+    throw new VoidNoteError(
+      kdf === "sha256"
+        ? "VoidNote: decryption failed — the link's key is wrong or incomplete"
+        : "VoidNote: decryption failed — wrong password (this read used a view)",
+      "decryption_failed",
+    );
+  }
   return new TextDecoder().decode(plain);
+}
+
+function checkKdf(kdf: unknown): NoteKdf {
+  const name = kdf ?? "sha256";
+  if (!KDFS.includes(name as NoteKdf)) {
+    throw new VoidNoteError(
+      `VoidNote: this note uses key derivation "${String(name)}", which this SDK version cannot decrypt — upgrade voidnote-sdk`,
+      "unsupported_kdf",
+    );
+  }
+  return name as NoteKdf;
+}
+
+function positiveInt(name: string, value: number): number {
+  if (!Number.isInteger(value) || value < 1) throw new RangeError(`${name} must be a positive integer`);
+  return value;
 }
 
 type ParsedUrl =
@@ -111,46 +256,50 @@ function parseNoteUrl(input: string): ParsedUrl {
  * Create a VoidNote. Encrypts content client-side — server never sees plaintext.
  * Uses the v1 API: server generates tokenId, client holds the secret in the URL fragment.
  *
+ * No API key is needed: without one the note is anonymous, held to 168 hours and
+ * 10 views, and rate-limited per IP. With a password the key is derived with
+ * PBKDF2 and the reader needs both the link and the password.
+ *
  * @param content   The secret text to encrypt and store
- * @param options   { apiKey, maxViews?, expiresIn? }
+ * @param options   { apiKey?, password?, maxViews?, expiresIn? }
  * @param base      Override the base URL (default: https://voidnote.net)
- * @returns         { url, token, expiresAt } — url includes #secret, share the full url
+ * @returns         { url, token, expiresAt, viewLimit, kdf } — url includes #secret, share the full url
+ * @throws          VoidNoteError with the server's message (e.g. HTTP 429 with retryAfter)
  */
 export async function create(
   content: string,
-  options: CreateOptions,
+  options: CreateOptions = {},
   base = DEFAULT_BASE,
 ): Promise<CreateResult> {
+  if (options.password === "") throw new TypeError("password must not be empty");
+  const kdf: NoteKdf = options.password ? "pbkdf2-sha256-600k" : "sha256";
+  const viewLimit = positiveInt("maxViews", options.maxViews ?? 1);
+  const expiresIn = positiveInt("expiresIn", options.expiresIn ?? 1) * 3600; // hours → seconds
+
   // Client generates only the secret — server generates the tokenId
   const secretBytes = new Uint8Array(16);
   crypto.getRandomValues(secretBytes);
   const secret = bufToHex(secretBytes);
 
-  const { encrypted, iv } = await encryptContent(content, secret);
-  const expiresIn = (options.expiresIn ?? 1) * 3600; // hours → seconds
+  const key = await deriveNoteKey(secret, kdf, options.password ?? null, ["encrypt"]);
+  const { encrypted, iv } = await encryptWithKey(content, key);
 
-  const res = await fetch(`${base}/api/v1/note/`, {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (options.apiKey) headers.Authorization = `Bearer ${options.apiKey}`;
+
+  const json = await getJson(`${base}/api/v1/note/`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${options.apiKey}`,
-    },
-    body: JSON.stringify({
-      encrypted,
-      iv,
-      expiresIn,
-      viewLimit: options.maxViews ?? 1,
-    }),
+    headers,
+    body: JSON.stringify({ encrypted, iv, expiresIn, viewLimit, kdf }),
   });
-
-  const json = (await res.json()) as any;
-  if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
 
   // Server returns URL without the secret — append #secret for the shareable link
   return {
     url: `${json.url}#${secret}`,
     token: json.token,
     expiresAt: json.expiresAt,
+    viewLimit: json.viewLimit ?? viewLimit,
+    kdf: json.kdf ?? kdf,
   };
 }
 
@@ -160,32 +309,51 @@ export async function create(
  * Accepts both v1 URLs (https://voidnote.net/n/{tokenId}#{secret})
  * and legacy URLs (https://voidnote.net/note/{64-char-token}).
  *
- * @param urlOrToken  Full VoidNote URL or raw 64-char hex token (legacy)
- * @param base        Override the base URL (default: https://voidnote.net)
+ * v1 notes are checked first without using a view: a missing note, a note that
+ * needs a password when none was given, or an unknown key derivation throws a
+ * VoidNoteError ("not_found", "password_required", "unsupported_kdf") and the
+ * view stays unused. A wrong password is only detectable after the view is used.
+ *
+ * @param urlOrToken     Full VoidNote URL or raw 64-char hex token (legacy)
+ * @param baseOrOptions  Base URL override, or { password?, base? }
  */
-export async function read(urlOrToken: string, base = DEFAULT_BASE): Promise<ReadResult> {
+export async function read(urlOrToken: string, baseOrOptions: string | ReadOptions = {}): Promise<ReadResult> {
+  const options: ReadOptions = typeof baseOrOptions === "string" ? { base: baseOrOptions } : baseOrOptions;
+  const base = options.base ?? DEFAULT_BASE;
   const parsed = parseNoteUrl(urlOrToken);
 
   if (parsed.type === "v1") {
     const { tokenId, secret } = parsed;
-    const res = await fetch(`${base}/api/v1/note/${tokenId}/consume/`);
-    const json = (await res.json()) as any;
-    if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
-    const content = await decryptContent(json.encrypted, json.iv, secret);
+    const meta = (await getJson(`${base}/api/v1/note/${tokenId}/meta/`)) as PeekResult;
+    if (!meta.exists) {
+      throw new VoidNoteError("VoidNote: note not found, expired or already destroyed", "not_found");
+    }
+    const metaKdf = checkKdf(meta.kdf);
+    if (metaKdf !== "sha256" && !options.password) {
+      throw new VoidNoteError(
+        "VoidNote: this note needs a password — pass { password } (no view was used)",
+        "password_required",
+      );
+    }
+
+    const json = await getJson(`${base}/api/v1/note/${tokenId}/consume/`);
+    const kdf = checkKdf(json.kdf ?? metaKdf);
+    const content = await decryptNote(json.encrypted, json.iv, secret, kdf, options.password ?? null);
+    const viewsRemaining: number = json.viewsRemaining ?? 0;
+    const maxViews = meta.viewLimit ?? viewsRemaining + 1;
     return {
       content,
       title: null,
-      viewCount: 1,
-      maxViews: (json.viewsRemaining ?? 0) + 1,
+      viewCount: maxViews - viewsRemaining,
+      maxViews,
       destroyed: json.destroyed ?? false,
-      viewsRemaining: json.viewsRemaining ?? 0,
+      viewsRemaining,
+      kdf,
     };
   }
 
   // Legacy: server decrypts and returns plaintext
-  const res = await fetch(`${base}/api/note/${parsed.fullToken}/`);
-  const json = (await res.json()) as any;
-  if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
+  const json = await getJson(`${base}/api/note/${parsed.fullToken}/`);
   return {
     content: json.content,
     title: json.title ?? null,
@@ -196,7 +364,8 @@ export async function read(urlOrToken: string, base = DEFAULT_BASE): Promise<Rea
 }
 
 /**
- * Peek at note metadata without consuming a view.
+ * Peek at note metadata without consuming a view. `kdf` tells whether the note
+ * needs a password ("pbkdf2-sha256-600k") or not ("sha256").
  * Works with v1 URLs (and extracts the tokenId automatically).
  *
  * @param urlOrToken  VoidNote URL (v1 format with #secret, or just the 32-char tokenId)
@@ -218,10 +387,7 @@ export async function peek(urlOrToken: string, base = DEFAULT_BASE): Promise<Pee
     tokenId = match[0].toLowerCase();
   }
 
-  const res = await fetch(`${base}/api/v1/note/${tokenId}/meta/`);
-  const json = (await res.json()) as any;
-  if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
-  return json as PeekResult;
+  return (await getJson(`${base}/api/v1/note/${tokenId}/meta/`)) as PeekResult;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,24 +412,8 @@ export interface WatchOptions {
   password?: string;
 }
 
-/** Error carrying the HTTP status and the server's error message. */
-async function httpError(res: Response): Promise<Error> {
-  let detail = "";
-  try {
-    const text = (await res.text()).trim();
-    try {
-      detail = (JSON.parse(text) as { error?: string }).error ?? text;
-    } catch {
-      detail = text;
-    }
-  } catch {
-    // body unreadable — status alone
-  }
-  return new Error(`VoidNote: HTTP ${res.status}${detail ? ` — ${detail.slice(0, 300)}` : ""}`);
-}
-
 /**
- * Create a new Void Stream. Costs 1 credit.
+ * Create a new Void Stream. Requires an API key from a free account.
  * The returned handle authenticates write() and close() with the same API key.
  */
 export async function createStream(
@@ -433,69 +583,4 @@ export async function* watch(
     }
     // Segment ended — reconnect
   }
-}
-
-// --- Buy / Credits API ---
-
-export interface CryptoOrderOptions {
-  apiKey: string;
-  bundleId: "test" | "starter" | "standard" | "pro";
-  chain: "polygon" | "base" | "arbitrum" | "ethereum" | "bitcoin" | "tron";
-  token: "USDT" | "USDC" | "ETH" | "BTC" | "TRX";
-}
-
-export interface CryptoOrder {
-  orderId: string;
-  toAddress: string;
-  chain: string;
-  token: string;
-  amount: string;
-  amountUsd: number;
-  credits: number;
-  expiresAt: string;
-}
-
-export interface SubmitPaymentOptions {
-  apiKey: string;
-  orderId: string;
-  txHash: string;
-}
-
-export interface SubmitPaymentResult {
-  credits: number;
-  creditsAdded: number;
-}
-
-export async function createCryptoOrder(
-  options: CryptoOrderOptions,
-  base = DEFAULT_BASE,
-): Promise<CryptoOrder> {
-  const res = await fetch(`${base}/api/buy/crypto/create-order/`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${options.apiKey}`,
-    },
-    body: JSON.stringify({ bundleId: options.bundleId, chain: options.chain, token: options.token }),
-  });
-  const json = (await res.json()) as any;
-  if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
-  return json as CryptoOrder;
-}
-
-export async function submitCryptoPayment(
-  options: SubmitPaymentOptions,
-  base = DEFAULT_BASE,
-): Promise<SubmitPaymentResult> {
-  const res = await fetch(`${base}/api/buy/crypto/submit-tx/`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${options.apiKey}`,
-    },
-    body: JSON.stringify({ orderId: options.orderId, txHash: options.txHash }),
-  });
-  const json = (await res.json()) as any;
-  if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
-  return { credits: json.credits, creditsAdded: json.creditsAdded };
 }
